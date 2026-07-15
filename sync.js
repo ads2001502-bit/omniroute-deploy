@@ -3,7 +3,7 @@ const https = require('https');
 
 const datasetId = process.env.DATASET_ID;
 const token = process.env.HF_TOKEN;
-const dbPath = '/data/db.sqlite';
+const dbPath = process.env.DATA_DIR ? `${process.env.DATA_DIR}/db.sqlite` : '/app/data/db.sqlite';
 
 if (!datasetId || !token) {
     console.error("DATASET_ID or HF_TOKEN not provided.");
@@ -63,7 +63,8 @@ async function downloadDB() {
         };
         https.get(fileUrl, options, (res) => {
             if (res.statusCode === 200) {
-                if (!fs.existsSync('/data')) fs.mkdirSync('/data', { recursive: true });
+                const dir = dbPath.substring(0, dbPath.lastIndexOf('/'));
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
                 const file = fs.createWriteStream(dbPath);
                 res.pipe(file);
                 file.on('finish', () => {
@@ -75,10 +76,10 @@ async function downloadDB() {
                 console.log("[Sync] No existing db.sqlite found in dataset. Starting fresh.");
                 resolve();
             } else if (res.statusCode === 302 || res.statusCode === 301) {
-                // Handle redirect
                 https.get(res.headers.location, options, (res2) => {
                    if (res2.statusCode === 200) {
-                       if (!fs.existsSync('/data')) fs.mkdirSync('/data', { recursive: true });
+                       const dir = dbPath.substring(0, dbPath.lastIndexOf('/'));
+                       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
                        const file = fs.createWriteStream(dbPath);
                        res2.pipe(file);
                        file.on('finish', () => { file.close(); console.log("[Sync] Download complete."); resolve(); });
