@@ -11,4 +11,4 @@ echo "[Entrypoint] Starting upload loop in background..."
 node /sync.js upload-loop &
 
 echo "[Entrypoint] Starting OmniRoute..."
-exec "$@"
+exec node dev/run-standalone.mjs
