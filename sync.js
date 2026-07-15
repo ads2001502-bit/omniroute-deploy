@@ -4,6 +4,7 @@ const https = require('https');
 const datasetId = process.env.DATASET_ID;
 const token = process.env.HF_TOKEN;
 const dbPath = process.env.DATA_DIR ? `${process.env.DATA_DIR}/db.sqlite` : '/app/data/db.sqlite';
+const logPath = '/app/server.log';
 
 if (!datasetId || !token) {
     console.error("DATASET_ID or HF_TOKEN not provided.");
@@ -30,11 +31,21 @@ function apiRequest(options, payload) {
 }
 
 async function uploadDB() {
-    if (!fs.existsSync(dbPath)) return;
-    try {
+    let operations = [];
+    if (fs.existsSync(dbPath)) {
         const content = fs.readFileSync(dbPath).toString('base64');
+        operations.push({ key: "db.sqlite", path: "db.sqlite", content: content, b64content: true });
+    }
+    if (fs.existsSync(logPath)) {
+        const logContent = fs.readFileSync(logPath).toString('utf-8');
+        operations.push({ key: "server.log", path: "server.log", content: logContent });
+    }
+    
+    if (operations.length === 0) return;
+    
+    try {
         const payload = JSON.stringify({
-            operations: [{ key: "db.sqlite", path: "db.sqlite", content: content, b64content: true }],
+            operations: operations,
             commit_message: "Auto-sync from OmniRoute Space"
         });
         const options = {
@@ -48,7 +59,7 @@ async function uploadDB() {
             }
         };
         await apiRequest(options, payload);
-        console.log(`[Sync] Successfully backed up db.sqlite to dataset ${datasetId} at ${new Date().toISOString()}`);
+        console.log(`[Sync] Successfully backed up to dataset ${datasetId} at ${new Date().toISOString()}`);
     } catch (e) {
         console.error("[Sync] Upload failed:", e);
     }
@@ -98,5 +109,5 @@ const mode = process.argv[2];
 if (mode === 'download') {
     downloadDB().catch(console.error);
 } else if (mode === 'upload-loop') {
-    setInterval(uploadDB, 5 * 60 * 1000);
+    setInterval(uploadDB, 30 * 1000); // 30 seconds for debugging
 }
