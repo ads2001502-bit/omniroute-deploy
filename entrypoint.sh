@@ -13,5 +13,5 @@ node /sync.js upload-loop &
 echo "[Entrypoint] Starting OmniRoute with strict memory limit..."
 # Bypass run-standalone wrapper to save 100MB of RAM
 # Directly run the websocket server with strict V8 heap limit
-export NODE_OPTIONS="--max-old-space-size=250"
+export NODE_OPTIONS="--max-old-space-size=450"
 exec node server-ws.mjs
