@@ -1,6 +1,8 @@
 #!/bin/sh
 set -e
 
+cd /app
+
 mkdir -p /app/data /data
 chmod -R 777 /app/data /data || true
 
