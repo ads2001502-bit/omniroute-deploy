@@ -1,152 +1,121 @@
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
+const crypto = require('crypto');
 
-const datasetId = process.env.DATASET_ID || 'ghoststudio1/omniroute-db';
-const token = process.env.HF_TOKEN || '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';
+const ghToken = process.env.GH_TOKEN;
+const ghRepo = process.env.GH_REPO || 'ads2001502-bit/omniroute-storage';
 const dataDir = process.env.DATA_DIR || '/app/data';
-const logPath = '/app/server.log';
+const targetFiles = ['storage.sqlite', 'db.sqlite'];
 
-if (!datasetId || !token) {
-    console.error("[Sync] DATASET_ID or HF_TOKEN not provided.");
+if (!ghToken) {
+    console.error("[Sync] GH_TOKEN environment variable is required.");
     process.exit(1);
 }
 
-function apiRequest(options, payload) {
+let lastHashes = {};
+
+function ghRequest(endpoint, method, payload) {
     return new Promise((resolve, reject) => {
+        const bodyStr = payload ? JSON.stringify(payload) : null;
+        const options = {
+            hostname: 'api.github.com',
+            path: endpoint,
+            method: method || 'GET',
+            headers: {
+                'Authorization': `Bearer ${ghToken}`,
+                'Accept': 'application/vnd.github+json',
+                'User-Agent': 'OmniRoute-Sync-Service',
+                'X-GitHub-Api-Version': '2022-11-28'
+            }
+        };
+        if (bodyStr) {
+            options.headers['Content-Type'] = 'application/json';
+            options.headers['Content-Length'] = Buffer.byteLength(bodyStr);
+        }
+
         const req = https.request(options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 if (res.statusCode >= 200 && res.statusCode < 300) {
-                    resolve(data ? JSON.parse(data) : null);
+                    try { resolve(JSON.parse(data)); } catch(e) { resolve(data); }
+                } else if (res.statusCode === 404) {
+                    resolve(null);
                 } else {
-                    reject(`HTTP ${res.statusCode}: ${data}`);
+                    reject(new Error(`GitHub API HTTP ${res.statusCode}: ${data}`));
                 }
             });
         });
         req.on('error', reject);
-        if (payload) req.write(payload);
+        req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+        if (bodyStr) req.write(bodyStr);
         req.end();
     });
 }
 
-const targetFiles = ['storage.sqlite', 'db.sqlite'];
-
-async function uploadDB() {
-    let operations = [];
-    
-    const dirsToCheck = [dataDir, '/app/data', '/data'];
-    const seen = new Set();
-
-    for (const d of dirsToCheck) {
-        if (!fs.existsSync(d)) continue;
-        for (const f of targetFiles) {
-            const fullPath = path.join(d, f);
-            if (fs.existsSync(fullPath) && !seen.has(f)) {
-                seen.add(f);
-                try {
-                    const content = fs.readFileSync(fullPath).toString('base64');
-                    operations.push({
-                        key: f,
-                        path: f,
-                        content: content,
-                        b64content: true
-                    });
-                } catch(e){}
-            }
-        }
-    }
-
-    if (fs.existsSync(logPath)) {
-        try {
-            const logContent = fs.readFileSync(logPath).toString('utf-8');
-            operations.push({ key: "server.log", path: "server.log", content: logContent });
-        } catch(e){}
-    }
-    
-    if (operations.length === 0) return;
-    
-    try {
-        const payload = JSON.stringify({
-            operations: operations,
-            commit_message: `Auto-sync database at ${new Date().toISOString()}`
-        });
-        const options = {
-            hostname: 'huggingface.co',
-            path: `/api/datasets/${datasetId}/commit/main`,
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload)
-            }
-        };
-        await apiRequest(options, payload);
-        console.log(`[Sync] Successfully backed up ${operations.length} file(s) to dataset ${datasetId}`);
-    } catch (e) {
-        console.error("[Sync] Upload failed:", e);
-    }
+function getMd5(buf) {
+    return crypto.createHash('md5').update(buf).digest('hex');
 }
 
-function downloadSingleFile(filename) {
-    return new Promise((resolve) => {
-        const fileUrl = `https://huggingface.co/datasets/${datasetId}/resolve/main/${filename}`;
-        const options = {
-            headers: { 'Authorization': `Bearer ${token}` }
-        };
+async function uploadDB() {
+    for (const filename of targetFiles) {
+        const fullPath = path.join(dataDir, filename);
+        if (!fs.existsSync(fullPath)) continue;
 
-        function fetchWithRedirect(url) {
-            const req = https.get(url, options, (res) => {
-                if (res.statusCode === 200) {
-                    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-                    const targetPath = path.join(dataDir, filename);
-                    const file = fs.createWriteStream(targetPath);
-                    res.pipe(file);
-                    file.on('finish', () => {
-                        file.close();
-                        console.log(`[Sync] Downloaded ${filename}`);
-                        if (dataDir !== '/app/data') {
-                            if (!fs.existsSync('/app/data')) fs.mkdirSync('/app/data', { recursive: true });
-                            try { fs.copyFileSync(targetPath, path.join('/app/data', filename)); } catch(e){}
-                        }
-                        resolve(true);
-                    });
-                } else if (res.statusCode === 302 || res.statusCode === 301) {
-                    res.resume();
-                    fetchWithRedirect(res.headers.location);
-                } else {
-                    res.resume();
-                    resolve(false);
-                }
-            });
-            req.on('error', () => resolve(false));
-            req.setTimeout(5000, () => {
-                req.destroy();
-                resolve(false);
-            });
+        try {
+            const buf = fs.readFileSync(fullPath);
+            const currentHash = getMd5(buf);
+            if (lastHashes[filename] === currentHash) {
+                // No changes, skip uploading
+                continue;
+            }
+
+            // Get existing SHA from GitHub if file exists
+            const existing = await ghRequest(`/repos/${ghRepo}/contents/${filename}`, 'GET');
+            const sha = existing ? existing.sha : undefined;
+
+            const payload = {
+                message: `Auto-sync ${filename} at ${new Date().toISOString()}`,
+                content: buf.toString('base64'),
+                sha: sha
+            };
+
+            await ghRequest(`/repos/${ghRepo}/contents/${filename}`, 'PUT', payload);
+            lastHashes[filename] = currentHash;
+            console.log(`[Sync] Successfully backed up ${filename} to GitHub storage repo!`);
+        } catch(e) {
+            console.error(`[Sync] Upload error for ${filename}:`, e.message);
         }
-
-        fetchWithRedirect(fileUrl);
-    });
+    }
 }
 
 async function downloadDB() {
-    console.log(`[Sync] Checking for existing databases in ${datasetId}...`);
-    for (const f of targetFiles) {
-        await downloadSingleFile(f);
+    console.log(`[Sync] Checking for backup in GitHub repository (${ghRepo})...`);
+    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+    for (const filename of targetFiles) {
+        try {
+            const existing = await ghRequest(`/repos/${ghRepo}/contents/${filename}`, 'GET');
+            if (existing && existing.content) {
+                const buf = Buffer.from(existing.content, 'base64');
+                const targetPath = path.join(dataDir, filename);
+                fs.writeFileSync(targetPath, buf);
+                lastHashes[filename] = getMd5(buf);
+                console.log(`[Sync] Restored ${filename} (${buf.length} bytes) from GitHub backup!`);
+            } else {
+                console.log(`[Sync] No backup found for ${filename} (fresh start).`);
+            }
+        } catch(e) {
+            console.error(`[Sync] Download error for ${filename}:`, e.message);
+        }
     }
-    console.log("[Sync] Initialization complete.");
 }
 
 async function main() {
     const mode = process.argv[2];
     if (mode === 'download') {
-        try {
-            await downloadDB();
-        } catch(e) {
-            console.error(e);
-        }
+        await downloadDB();
         process.exit(0);
     } else if (mode === 'upload-loop') {
         setInterval(uploadDB, 20 * 1000);
