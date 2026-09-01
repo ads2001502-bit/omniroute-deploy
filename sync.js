@@ -31,12 +31,11 @@ function apiRequest(options, payload) {
     });
 }
 
-const targetFiles = ['storage.sqlite', 'db.sqlite', 'storage.sqlite-wal', 'storage.sqlite-shm'];
+const targetFiles = ['storage.sqlite', 'db.sqlite'];
 
 async function uploadDB() {
     let operations = [];
     
-    // Check files in dataDir and /app/data
     const dirsToCheck = [dataDir, '/app/data', '/data'];
     const seen = new Set();
 
@@ -46,20 +45,24 @@ async function uploadDB() {
             const fullPath = path.join(d, f);
             if (fs.existsSync(fullPath) && !seen.has(f)) {
                 seen.add(f);
-                const content = fs.readFileSync(fullPath).toString('base64');
-                operations.push({
-                    key: f,
-                    path: f,
-                    content: content,
-                    b64content: true
-                });
+                try {
+                    const content = fs.readFileSync(fullPath).toString('base64');
+                    operations.push({
+                        key: f,
+                        path: f,
+                        content: content,
+                        b64content: true
+                    });
+                } catch(e){}
             }
         }
     }
 
     if (fs.existsSync(logPath)) {
-        const logContent = fs.readFileSync(logPath).toString('utf-8');
-        operations.push({ key: "server.log", path: "server.log", content: logContent });
+        try {
+            const logContent = fs.readFileSync(logPath).toString('utf-8');
+            operations.push({ key: "server.log", path: "server.log", content: logContent });
+        } catch(e){}
     }
     
     if (operations.length === 0) return;
@@ -80,7 +83,7 @@ async function uploadDB() {
             }
         };
         await apiRequest(options, payload);
-        console.log(`[Sync] Successfully backed up ${operations.length} files to dataset ${datasetId}`);
+        console.log(`[Sync] Successfully backed up ${operations.length} file(s) to dataset ${datasetId}`);
     } catch (e) {
         console.error("[Sync] Upload failed:", e);
     }
@@ -94,7 +97,7 @@ function downloadSingleFile(filename) {
         };
 
         function fetchWithRedirect(url) {
-            https.get(url, options, (res) => {
+            const req = https.get(url, options, (res) => {
                 if (res.statusCode === 200) {
                     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
                     const targetPath = path.join(dataDir, filename);
@@ -102,8 +105,7 @@ function downloadSingleFile(filename) {
                     res.pipe(file);
                     file.on('finish', () => {
                         file.close();
-                        console.log(`[Sync] Downloaded ${filename} to ${targetPath}`);
-                        // also copy to /app/data if different
+                        console.log(`[Sync] Downloaded ${filename}`);
                         if (dataDir !== '/app/data') {
                             if (!fs.existsSync('/app/data')) fs.mkdirSync('/app/data', { recursive: true });
                             try { fs.copyFileSync(targetPath, path.join('/app/data', filename)); } catch(e){}
@@ -111,11 +113,18 @@ function downloadSingleFile(filename) {
                         resolve(true);
                     });
                 } else if (res.statusCode === 302 || res.statusCode === 301) {
+                    res.resume();
                     fetchWithRedirect(res.headers.location);
                 } else {
+                    res.resume();
                     resolve(false);
                 }
-            }).on('error', () => resolve(false));
+            });
+            req.on('error', () => resolve(false));
+            req.setTimeout(5000, () => {
+                req.destroy();
+                resolve(false);
+            });
         }
 
         fetchWithRedirect(fileUrl);
@@ -130,9 +139,18 @@ async function downloadDB() {
     console.log("[Sync] Initialization complete.");
 }
 
-const mode = process.argv[2];
-if (mode === 'download') {
-    downloadDB().catch(console.error);
-} else if (mode === 'upload-loop') {
-    setInterval(uploadDB, 20 * 1000); // sync every 20 seconds
+async function main() {
+    const mode = process.argv[2];
+    if (mode === 'download') {
+        try {
+            await downloadDB();
+        } catch(e) {
+            console.error(e);
+        }
+        process.exit(0);
+    } else if (mode === 'upload-loop') {
+        setInterval(uploadDB, 20 * 1000);
+    }
 }
+
+main();
