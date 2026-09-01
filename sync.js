@@ -1,13 +1,14 @@
 const fs = require('fs');
 const https = require('https');
+const path = require('path');
 
-const datasetId = process.env.DATASET_ID;
-const token = process.env.HF_TOKEN;
-const dbPath = process.env.DATA_DIR ? `${process.env.DATA_DIR}/db.sqlite` : '/app/data/db.sqlite';
+const datasetId = process.env.DATASET_ID || 'ghoststudio1/omniroute-db';
+const token = process.env.HF_TOKEN || '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';
+const dataDir = process.env.DATA_DIR || '/app/data';
 const logPath = '/app/server.log';
 
 if (!datasetId || !token) {
-    console.error("DATASET_ID or HF_TOKEN not provided.");
+    console.error("[Sync] DATASET_ID or HF_TOKEN not provided.");
     process.exit(1);
 }
 
@@ -30,12 +31,32 @@ function apiRequest(options, payload) {
     });
 }
 
+const targetFiles = ['storage.sqlite', 'db.sqlite', 'storage.sqlite-wal', 'storage.sqlite-shm'];
+
 async function uploadDB() {
     let operations = [];
-    if (fs.existsSync(dbPath)) {
-        const content = fs.readFileSync(dbPath).toString('base64');
-        operations.push({ key: "db.sqlite", path: "db.sqlite", content: content, b64content: true });
+    
+    // Check files in dataDir and /app/data
+    const dirsToCheck = [dataDir, '/app/data', '/data'];
+    const seen = new Set();
+
+    for (const d of dirsToCheck) {
+        if (!fs.existsSync(d)) continue;
+        for (const f of targetFiles) {
+            const fullPath = path.join(d, f);
+            if (fs.existsSync(fullPath) && !seen.has(f)) {
+                seen.add(f);
+                const content = fs.readFileSync(fullPath).toString('base64');
+                operations.push({
+                    key: f,
+                    path: f,
+                    content: content,
+                    b64content: true
+                });
+            }
+        }
     }
+
     if (fs.existsSync(logPath)) {
         const logContent = fs.readFileSync(logPath).toString('utf-8');
         operations.push({ key: "server.log", path: "server.log", content: logContent });
@@ -46,7 +67,7 @@ async function uploadDB() {
     try {
         const payload = JSON.stringify({
             operations: operations,
-            commit_message: "Auto-sync from OmniRoute Space"
+            commit_message: `Auto-sync database at ${new Date().toISOString()}`
         });
         const options = {
             hostname: 'huggingface.co',
@@ -59,55 +80,59 @@ async function uploadDB() {
             }
         };
         await apiRequest(options, payload);
-        console.log(`[Sync] Successfully backed up to dataset ${datasetId} at ${new Date().toISOString()}`);
+        console.log(`[Sync] Successfully backed up ${operations.length} files to dataset ${datasetId}`);
     } catch (e) {
         console.error("[Sync] Upload failed:", e);
     }
 }
 
-async function downloadDB() {
-    return new Promise((resolve, reject) => {
-        const fileUrl = `https://huggingface.co/datasets/${datasetId}/resolve/main/db.sqlite`;
-        console.log(`[Sync] Attempting to download ${fileUrl}`);
+function downloadSingleFile(filename) {
+    return new Promise((resolve) => {
+        const fileUrl = `https://huggingface.co/datasets/${datasetId}/resolve/main/${filename}`;
         const options = {
             headers: { 'Authorization': `Bearer ${token}` }
         };
-        https.get(fileUrl, options, (res) => {
-            if (res.statusCode === 200) {
-                const dir = dbPath.substring(0, dbPath.lastIndexOf('/'));
-                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                const file = fs.createWriteStream(dbPath);
-                res.pipe(file);
-                file.on('finish', () => {
-                    file.close();
-                    console.log("[Sync] Download complete.");
-                    resolve();
-                });
-            } else if (res.statusCode === 404) {
-                console.log("[Sync] No existing db.sqlite found in dataset. Starting fresh.");
-                resolve();
-            } else if (res.statusCode === 302 || res.statusCode === 301) {
-                https.get(res.headers.location, options, (res2) => {
-                   if (res2.statusCode === 200) {
-                       const dir = dbPath.substring(0, dbPath.lastIndexOf('/'));
-                       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-                       const file = fs.createWriteStream(dbPath);
-                       res2.pipe(file);
-                       file.on('finish', () => { file.close(); console.log("[Sync] Download complete."); resolve(); });
-                   } else {
-                       reject(`Redirect failed with status ${res2.statusCode}`);
-                   }
-                }).on('error', reject);
-            } else {
-                reject(`HTTP ${res.statusCode}`);
-            }
-        }).on('error', reject);
+
+        function fetchWithRedirect(url) {
+            https.get(url, options, (res) => {
+                if (res.statusCode === 200) {
+                    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+                    const targetPath = path.join(dataDir, filename);
+                    const file = fs.createWriteStream(targetPath);
+                    res.pipe(file);
+                    file.on('finish', () => {
+                        file.close();
+                        console.log(`[Sync] Downloaded ${filename} to ${targetPath}`);
+                        // also copy to /app/data if different
+                        if (dataDir !== '/app/data') {
+                            if (!fs.existsSync('/app/data')) fs.mkdirSync('/app/data', { recursive: true });
+                            try { fs.copyFileSync(targetPath, path.join('/app/data', filename)); } catch(e){}
+                        }
+                        resolve(true);
+                    });
+                } else if (res.statusCode === 302 || res.statusCode === 301) {
+                    fetchWithRedirect(res.headers.location);
+                } else {
+                    resolve(false);
+                }
+            }).on('error', () => resolve(false));
+        }
+
+        fetchWithRedirect(fileUrl);
     });
+}
+
+async function downloadDB() {
+    console.log(`[Sync] Checking for existing databases in ${datasetId}...`);
+    for (const f of targetFiles) {
+        await downloadSingleFile(f);
+    }
+    console.log("[Sync] Initialization complete.");
 }
 
 const mode = process.argv[2];
 if (mode === 'download') {
     downloadDB().catch(console.error);
 } else if (mode === 'upload-loop') {
-    setInterval(uploadDB, 30 * 1000); // 30 seconds for debugging
+    setInterval(uploadDB, 20 * 1000); // sync every 20 seconds
 }
